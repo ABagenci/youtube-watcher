@@ -36,7 +36,7 @@ def webhook():
                 "Content-Type": "application/json"
             },
             json={
-                "version": "whisper model ID tu",  # podam później
+                "version": "a3f2f020c5608ed204f3b44e360fe4b7edbc8a8b2cc87e91d8e5407c5d3cb760",  # podam później
                 "input": {
                     "audio": f.read()
                 }
@@ -53,7 +53,7 @@ def webhook():
             "Content-Type": "application/json"
         },
         json={
-            "version": "llama-3 model ID tu",  # podam później
+            "version": "a8f2f19a28a49cfbf2705d1fe0e3e48c621cc48bafd1b90e66c911a66b6a41b3",  # podam później
             "input": {
                 "prompt": f"Podsumuj po polsku w punktach:\n{transcript_text}"
             }
