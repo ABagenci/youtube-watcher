@@ -29,10 +29,22 @@ def webhook():
     youtube_url = f"https://www.youtube.com/watch?v={video_id}"
     audio_file = "audio.mp3"
 
-    # === 1. Pobierz audio ===
-    subprocess.run(["yt-dlp", "-f", "bestaudio", "--extract-audio", "--audio-format", "mp3", "-o", audio_file, youtube_url])
+    # === 1. Pobierz audio z YouTube ===
+    result = subprocess.run(
+        ["yt-dlp", "-f", "bestaudio", "--extract-audio", "--audio-format", "mp3", "-o", audio_file, youtube_url],
+        capture_output=True,
+        text=True
+    )
 
-    # === 2. Wyślij do Whisper (Replicate) ===
+    if "sign in" in result.stderr.lower() or "cookies" in result.stderr.lower():
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="❗ Błąd pobierania filmu – prawdopodobnie potrzebne ciasteczka (cookies.txt). Zaloguj się na YouTube i uzupełnij je.")
+        return "❌ Błąd pobierania", 403
+
+    if not os.path.exists(audio_file):
+        return "❌ Nie udało się pobrać audio", 500
+
+    # === 2. Wyślij audio do Whisper (Replicate) ===
     with open(audio_file, "rb") as f:
         audio_b64 = base64.b64encode(f.read()).decode("utf-8")
 
@@ -55,7 +67,7 @@ def webhook():
     whisper_result = whisper_resp.json()
     print("📤 Whisper response:", whisper_result)
 
-    # Czekaj na wynik
+    # Czekaj na wynik transkrypcji
     prediction_url = whisper_result["urls"]["get"]
     while True:
         status_resp = requests.get(prediction_url, headers={"Authorization": f"Token {REPLICATE_TOKEN}"})
@@ -66,7 +78,7 @@ def webhook():
         elif status_data["status"] == "failed":
             return "❌ Błąd podczas transkrypcji", 500
 
-    # === 3. Generuj podsumowanie ===
+    # === 3. Generuj podsumowanie z LLaMA ===
     llama_payload = {
         "version": LLAMA_VERSION,
         "input": {
