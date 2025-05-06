@@ -1,143 +1,166 @@
+from flask import Flask, request, jsonify
+import subprocess
 import os
 import requests
-import subprocess
-import json
-import threading
-import time
-from telegram import Bot
 from gtts import gTTS
-from flask import Flask, request
-import base64
-
-# === KONFIGURACJA ===
-REPLICATE_TOKEN = os.getenv("REPLICATE_TOKEN")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-# === MODELE REPLICATE ===
-WHISPER_VERSION = "b8e0f14c5e094efca1e8cc36b5864b95c9c5e523580a38cf3606cc4976eaa46d"  # Whisper
-LLAMA_VERSION = "a8f2f19a28a49cfbf2705d1fe0e3e48c621cc48bafd1b90e66c911a66b6a41b3"    # LLaMA 3 (8B)
+import replicate
 
 app = Flask(__name__)
 
-def start_pinger():
-    def ping():
-        while True:
-            try:
-                requests.get("https://youtube-watcher-n7ve.onrender.com/")
-                print("📡 Ping sent to keep server alive.")
-            except Exception as e:
-                print("❌ Ping failed:", e)
-            time.sleep(40)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+REPLICATE_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 
-    thread = threading.Thread(target=ping, daemon=True)
-    thread.start()
+os.environ["REPLICATE_API_TOKEN"] = REPLICATE_TOKEN
 
+# ======== FUNKCJE TELEGRAM =========
 
-@app.route("/webhook", methods=["POST"])
+def send_telegram_message(message, parse_mode=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    try:
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Błąd wysyłania wiadomości na Telegram: {e}")
+
+def send_telegram_audio(audio_path):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendAudio"
+    try:
+        with open(audio_path, "rb") as audio:
+            response = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID}, files={"audio": audio})
+            response.raise_for_status()
+    except Exception as e:
+        send_telegram_message(f"❗ Błąd wysyłania audio: {e}")
+
+def log_error_to_telegram(title, message):
+    full_message = f"{title}\n```\n{message}\n```"
+    send_telegram_message(full_message, parse_mode="Markdown")
+
+# ======== YT-DLP: POBIERANIE AUDIO =========
+
+def download_audio(video_id):
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    output_path = f"downloads/{video_id}.mp3"
+    cookies_path = os.path.abspath("cookies.txt")
+
+    send_telegram_message("📥 Rozpoczynam pobieranie filmu...")
+    send_telegram_message(f"🎬 URL: {video_url}")
+    send_telegram_message(f"🧾 Ścieżka cookies: {cookies_path}")
+    send_telegram_message(f"📁 Ścieżka MP3: {output_path}")
+
+    command = [
+        "yt-dlp",
+        "--cookies", cookies_path,
+        "-f", "bestaudio",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "-o", output_path,
+        video_url
+    ]
+
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            log_error_to_telegram("❗ yt-dlp zakończone błędem", result.stderr)
+            return None
+
+        send_telegram_message("✅ Pomyślnie pobrano audio.")
+        return output_path
+
+    except Exception as e:
+        log_error_to_telegram("❗ Błąd wykonania yt-dlp", str(e))
+        return None
+
+# ======== TRANSKRYPCJA WHISPER + STRESZCZENIE LLaMA =========
+
+def transcribe_audio(audio_path):
+    send_telegram_message("🧠 Rozpoczynam transkrypcję...")
+    try:
+        output = replicate.run(
+            "openai/whisper",
+            input={"audio": open(audio_path, "rb")}
+        )
+        transcript = output["transcription"]
+        send_telegram_message("✅ Transkrypcja zakończona.")
+        return transcript
+    except Exception as e:
+        log_error_to_telegram("❗ Błąd transkrypcji", str(e))
+        return None
+
+def summarize_text(text):
+    send_telegram_message("📄 Tworzę podsumowanie...")
+    try:
+        output = replicate.run(
+            "meta/meta-llama-3-8b-instruct",
+            input={"prompt": f"Streszcz poniższy tekst:\n{text}"}
+        )
+        summary = "".join(output)
+        send_telegram_message("✅ Podsumowanie gotowe.")
+        return summary
+    except Exception as e:
+        log_error_to_telegram("❗ Błąd streszczania", str(e))
+        return None
+
+# ======== GENEROWANIE AUDIO Z GTTS =========
+
+def generate_tts(text, output_path="summary.mp3"):
+    send_telegram_message("🔊 Generuję plik audio z podsumowaniem...")
+    try:
+        tts = gTTS(text)
+        tts.save(output_path)
+        send_telegram_message("✅ Audio z podsumowaniem gotowe.")
+        return output_path
+    except Exception as e:
+        log_error_to_telegram("❗ Błąd TTS (gTTS)", str(e))
+        return None
+
+# ======== FLASK: OBSŁUGA WEBHOOKA =========
+
+@app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json()
     video_id = data.get("video_id")
-
     if not video_id:
-        return "❌ Brak video_id", 400
+        send_telegram_message("❗ Brak video_id w zapytaniu.")
+        return jsonify({"error": "No video_id"}), 400
 
-    youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-    audio_file = "audio.mp3"
+    send_telegram_message(f"📡 Odebrano webhook dla: `{video_id}`", parse_mode="Markdown")
 
-    print(f"🎬 Przetwarzam: {youtube_url}")
+    audio_path = download_audio(video_id)
+    if not audio_path:
+        return jsonify({"error": "Błąd pobierania"}), 500
 
-    # === 1. Pobierz audio z YouTube z cookies.txt ===
-    result = subprocess.run(
-        ["yt-dlp", "--cookies", "cookies.txt", "-f", "bestaudio", "--extract-audio", "--audio-format", "mp3", "-o", audio_file, youtube_url],
-        capture_output=True,
-        text=True
-    )
+    transcript = transcribe_audio(audio_path)
+    if not transcript:
+        return jsonify({"error": "Błąd transkrypcji"}), 500
 
-    print("📥 yt-dlp stderr:\n", result.stderr)
+    summary = summarize_text(transcript)
+    if not summary:
+        return jsonify({"error": "Błąd streszczenia"}), 500
 
-    if "sign in" in result.stderr.lower() or "cookies" in result.stderr.lower():
-        Bot(token=TELEGRAM_BOT_TOKEN).send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text="❗ Błąd pobierania filmu – prawdopodobnie potrzebne ciasteczka (cookies.txt). Zaloguj się na YouTube i uzupełnij je."
-        )
-        return "❌ Błąd pobierania", 403
+    send_telegram_message(f"📝 *Streszczenie filmu:*\n{summary}", parse_mode="Markdown")
 
-    if not os.path.exists(audio_file):
-        return "❌ Nie udało się pobrać audio", 500
+    summary_audio = generate_tts(summary)
+    if summary_audio:
+        send_telegram_audio(summary_audio)
 
-    # === 2. Wyślij do Whisper ===
-    with open(audio_file, "rb") as f:
-        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+    return jsonify({"status": "OK"}), 200
 
-    whisper_payload = {
-        "version": WHISPER_VERSION,
-        "input": {
-            "audio": f"data:audio/mp3;base64,{audio_b64}"
-        }
-    }
+# ======== KEEP ALIVE (PING) =========
 
-    whisper_resp = requests.post(
-        "https://api.replicate.com/v1/predictions",
-        headers={
-            "Authorization": f"Token {REPLICATE_TOKEN}",
-            "Content-Type": "application/json"
-        },
-        json=whisper_payload
-    )
-    whisper_result = whisper_resp.json()
-    print("📤 Whisper response:", whisper_result)
+@app.route('/')
+def ping():
+    return "✅ Agent działa", 200
 
-    prediction_url = whisper_result["urls"]["get"]
-    while True:
-        status_resp = requests.get(prediction_url, headers={"Authorization": f"Token {REPLICATE_TOKEN}"})
-        status_data = status_resp.json()
-        if status_data["status"] == "succeeded":
-            transcript_text = status_data["output"]["transcription"]
-            break
-        elif status_data["status"] == "failed":
-            return "❌ Błąd podczas transkrypcji", 500
+# ======== START SERVERA =========
 
-    # === 3. Podsumowanie z LLaMA ===
-    llama_payload = {
-        "version": LLAMA_VERSION,
-        "input": {
-            "prompt": f"Podsumuj po polsku w punktach:\n{transcript_text}"
-        }
-    }
-
-    summary_resp = requests.post(
-        "https://api.replicate.com/v1/predictions",
-        headers={
-            "Authorization": f"Token {REPLICATE_TOKEN}",
-            "Content-Type": "application/json"
-        },
-        json=llama_payload
-    )
-    llama_result = summary_resp.json()
-    prediction_url = llama_result["urls"]["get"]
-    while True:
-        status_resp = requests.get(prediction_url, headers={"Authorization": f"Token {REPLICATE_TOKEN}"})
-        status_data = status_resp.json()
-        if status_data["status"] == "succeeded":
-            summary = status_data["output"]
-            break
-        elif status_data["status"] == "failed":
-            return "❌ Błąd podczas podsumowania", 500
-
-    # === 4. Głos MP3 ===
-    tts = gTTS(text=summary, lang="pl")
-    tts.save("summary.mp3")
-
-    # === 5. Telegram ===
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🎧 Streszczenie filmu:\n" + summary)
-    with open("summary.mp3", "rb") as audio:
-        bot.send_audio(chat_id=TELEGRAM_CHAT_ID, audio=audio, title="Streszczenie")
-
-    return "✅ Gotowe"
-
-
-if __name__ == "__main__":
-    start_pinger()  # Pinguj co 40 sekund
-    app.run(host="0.0.0.0", port=10000)
+if __name__ == '__main__':
+    os.makedirs("downloads", exist_ok=True)
+    app.run(host='0.0.0.0', port=8080)
