@@ -31,7 +31,7 @@ def webhook():
 
     # === 1. Pobierz audio z YouTube ===
     result = subprocess.run(
-        ["yt-dlp", "-f", "bestaudio", "--extract-audio", "--audio-format", "mp3", "-o", audio_file, youtube_url],
+        ["yt-dlp", "--cookies", "cookies.txt", "-f", "bestaudio", "--extract-audio", "--audio-format", "mp3", "-o", audio_file, youtube_url],
         capture_output=True,
         text=True
     )
