@@ -4,3 +4,4 @@ gtts
 yt-dlp
 ffmpeg-python
 flask
+replicate
