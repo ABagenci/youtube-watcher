@@ -2,6 +2,8 @@ import os
 import requests
 import subprocess
 import json
+import threading
+import time
 from telegram import Bot
 from gtts import gTTS
 from flask import Flask, request
@@ -18,6 +20,20 @@ LLAMA_VERSION = "a8f2f19a28a49cfbf2705d1fe0e3e48c621cc48bafd1b90e66c911a66b6a41b
 
 app = Flask(__name__)
 
+def start_pinger():
+    def ping():
+        while True:
+            try:
+                requests.get("https://youtube-watcher-n7ve.onrender.com/")
+                print("📡 Ping sent to keep server alive.")
+            except Exception as e:
+                print("❌ Ping failed:", e)
+            time.sleep(40)
+
+    thread = threading.Thread(target=ping, daemon=True)
+    thread.start()
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
@@ -29,22 +45,28 @@ def webhook():
     youtube_url = f"https://www.youtube.com/watch?v={video_id}"
     audio_file = "audio.mp3"
 
-    # === 1. Pobierz audio z YouTube ===
+    print(f"🎬 Przetwarzam: {youtube_url}")
+
+    # === 1. Pobierz audio z YouTube z cookies.txt ===
     result = subprocess.run(
         ["yt-dlp", "--cookies", "cookies.txt", "-f", "bestaudio", "--extract-audio", "--audio-format", "mp3", "-o", audio_file, youtube_url],
         capture_output=True,
         text=True
     )
 
+    print("📥 yt-dlp stderr:\n", result.stderr)
+
     if "sign in" in result.stderr.lower() or "cookies" in result.stderr.lower():
-        bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="❗ Błąd pobierania filmu – prawdopodobnie potrzebne ciasteczka (cookies.txt). Zaloguj się na YouTube i uzupełnij je.")
+        Bot(token=TELEGRAM_BOT_TOKEN).send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text="❗ Błąd pobierania filmu – prawdopodobnie potrzebne ciasteczka (cookies.txt). Zaloguj się na YouTube i uzupełnij je."
+        )
         return "❌ Błąd pobierania", 403
 
     if not os.path.exists(audio_file):
         return "❌ Nie udało się pobrać audio", 500
 
-    # === 2. Wyślij audio do Whisper (Replicate) ===
+    # === 2. Wyślij do Whisper ===
     with open(audio_file, "rb") as f:
         audio_b64 = base64.b64encode(f.read()).decode("utf-8")
 
@@ -63,11 +85,9 @@ def webhook():
         },
         json=whisper_payload
     )
-
     whisper_result = whisper_resp.json()
     print("📤 Whisper response:", whisper_result)
 
-    # Czekaj na wynik transkrypcji
     prediction_url = whisper_result["urls"]["get"]
     while True:
         status_resp = requests.get(prediction_url, headers={"Authorization": f"Token {REPLICATE_TOKEN}"})
@@ -78,7 +98,7 @@ def webhook():
         elif status_data["status"] == "failed":
             return "❌ Błąd podczas transkrypcji", 500
 
-    # === 3. Generuj podsumowanie z LLaMA ===
+    # === 3. Podsumowanie z LLaMA ===
     llama_payload = {
         "version": LLAMA_VERSION,
         "input": {
@@ -94,7 +114,6 @@ def webhook():
         },
         json=llama_payload
     )
-
     llama_result = summary_resp.json()
     prediction_url = llama_result["urls"]["get"]
     while True:
@@ -110,7 +129,7 @@ def webhook():
     tts = gTTS(text=summary, lang="pl")
     tts.save("summary.mp3")
 
-    # === 5. Wyślij na Telegram ===
+    # === 5. Telegram ===
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🎧 Streszczenie filmu:\n" + summary)
     with open("summary.mp3", "rb") as audio:
@@ -118,5 +137,7 @@ def webhook():
 
     return "✅ Gotowe"
 
+
 if __name__ == "__main__":
+    start_pinger()  # Pinguj co 40 sekund
     app.run(host="0.0.0.0", port=10000)
